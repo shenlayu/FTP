@@ -1,6 +1,7 @@
 import socket
 import sys
 import random
+import os
 
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 21
@@ -45,6 +46,63 @@ def send_command(sock: socket.socket, command):
     print("RESPONSE:\n", response.strip())
     return last_line.strip()
 
+def retrieve_file(sock: socket.socket, filename: str, data_ip_address, constructing_data_method: dict):
+    local_save_path = input("Input the local path to save the downloaded file: ")
+    response = send_command(sock, f"RETR {filename}")
+
+    if response.startswith("550 "):
+        return
+    elif response.startswith("150 "):
+        if constructing_data_method["method"] == "PORT":
+            pass
+        elif constructing_data_method["method"] == "PASV":
+            data_ip_address = constructing_data_method["ip_address"]
+            data_port_number = constructing_data_method["port_number"]
+
+            data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            data_sock.connect((data_ip_address, data_port_number))
+            print("Data connection established.")
+        else:
+            print("Data connection must be established befoere transporting data.")
+            return
+        
+        # TODO
+        data_sock.close()
+    else:
+        pass
+
+def store_file(sock: socket.socket, filename: str, constructing_data_method: dict):
+    local_file_name = input("Input the local file to upload: ")
+    response = send_command(sock, f"STOR {filename}")
+
+    if response.startswith("550 "):
+        return
+    elif response.startswith("150 "):
+        if constructing_data_method["method"] == "PORT":
+            pass
+        elif constructing_data_method["method"] == "PASV":
+            data_ip_address = constructing_data_method["ip_address"]
+            data_port_number = constructing_data_method["port_number"]
+
+            data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            data_sock.connect((data_ip_address, data_port_number))
+            print("Data connection established.")
+        else:
+            print("Data connection must be established befoere transporting data.")
+            return
+        
+        with open(local_file_name, 'rb') as f:
+            while True:
+                data = f.read(BUFFER_SIZE)
+                if not data:
+                    break
+                data_sock.sendall(data)
+                print(f"Sent {len(data)} bytes")
+            print(f"File {filename} stored successfully.")
+        data_sock.close()
+    else:
+        pass
+
 def create_data_socket(ip, port):
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     data_sock.bind((ip, 0))  # Bind to a random port
@@ -53,6 +111,11 @@ def create_data_socket(ip, port):
 
 def main():
     ip_address, port_number = parse_arguments()
+    constructing_data_method = {
+        "method": "nothing",
+        "ip_address": "",
+        "port_number": -1
+    }
 
     # 创建TCP socket连接
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -105,29 +168,44 @@ def main():
                         port2 = port_number % 256
                         port_command = f"PORT {','.join(ip_parts)},{port1},{port2}"
                         response = send_command(sock, port_command)
+                        constructing_data_method["method"] = "PORT"
                     else:
                         print("Invalid port number. Please enter a port number between 20000 and 65535.")
                 except ValueError:
                     print("Invalid input format. Please enter in the format IP:PORT (e.g., 127.0.0.1:8888).")
 
-            
             elif command.startswith("PASV"):
                 response = send_command(sock, "PASV")
-                print("PASV command response:", response)
 
                 # 解析服务器返回的IP和端口
                 if response.startswith("227 "):
                     parts = response.split('(')[1].split(')')[0].split(',')
-                    server_ip = '.'.join(parts[:4])
-                    server_port = int(parts[4]) * 256 + int(parts[5])
-                    print(f"Server IP: {server_ip}, Port: {server_port}")
+                    data_ip_address = '.'.join(parts[:4])
+                    data_port_number = int(parts[4]) * 256 + int(parts[5])
+                    print(f"Server IP: {data_ip_address}, Port: {data_port_number}")
 
                     # 创建数据连接
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as data_sock:
-                        data_sock.connect((server_ip, server_port))
-                        print("Data connection established.")
-                        # 在此处理数据传输，例如接收文件
-                        data_sock.close()
+                    # with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as data_sock:
+                    # data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    # data_sock.connect((data_ip_address, data_port_number))
+                    # print("Data connection established.")
+                    constructing_data_method["method"] = "PASV"
+                    constructing_data_method["ip_address"] = data_ip_address
+                    constructing_data_method["port_number"] = data_port_number
+
+            elif command.startswith("RETR"):
+                filename = command.split(' ')[1]
+                retrieve_file(sock, filename, constructing_data_method)
+
+            elif command.startswith("STOR"):
+                filename = command.split(' ')[1]
+                store_file(sock, filename, constructing_data_method)
+                #     data_sock.close()
+                #     constructed_data_connection = False
+                # elif constructing_data_connection:
+                #     pass
+                # else:
+                #     print("Data connection must be established befoere transporting data.")
 
             # 解析和发送其他FTP命令
             # response = send_command(sock, command)
