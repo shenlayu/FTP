@@ -4,10 +4,13 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #define DEFAULT_PORT 21
 #define DEFAULT_ROOT "./data"
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 8192
 #define MAX_CLIENTS 10
 
 // TODO: 用docker
@@ -18,20 +21,32 @@ typedef struct {
     struct sockaddr_in address;
 } client_info;
 
+typedef enum {
+    PASV,
+    PORT,
+    NOTHING
+} Method;
+
+typedef struct {
+    Method method;        // 取值为 PASV, PORT 或 NOTHING
+    int data_socket;
+    char ip_address[INET_ADDRSTRLEN];
+    int port_number;
+} Data_connection_method;
+
 char *root_directory = DEFAULT_ROOT; // 默认根目录
 int port_number = DEFAULT_PORT;        // 默认端口
 
 // 服务器IP地址
 char server_ip[INET_ADDRSTRLEN] = "127.0.0.1";
 
-int data_socket = -1;
-
 // 处理PORT命令
-void handle_port_command(const char *command, int client_socket, char client_ip[INET_ADDRSTRLEN], int *client_port) {
+void handle_port_command(const char *command, int client_socket, Data_connection_method *data_connection_method) {
     int h1, h2, h3, h4, p1, p2;
     if (sscanf(command, "PORT %d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2) == 6) {
-        sprintf(client_ip, "%d.%d.%d.%d", h1, h2, h3, h4);
-        *client_port = p1 * 256 + p2;
+        sprintf(data_connection_method->ip_address, "%d.%d.%d.%d", h1, h2, h3, h4);
+        data_connection_method->port_number = p1 * 256 + p2;
+        data_connection_method->method = PORT;
         send(client_socket, "200 PORT command successful.\r\n", 30, 0);
     } else {
         send(client_socket, "500 Syntax error, command unrecognized.\r\n", 41, 0);
@@ -39,49 +54,86 @@ void handle_port_command(const char *command, int client_socket, char client_ip[
 }
 
 // 处理PASV命令
-int handle_pasv_command(int client_socket) {
+void handle_pasv_command(int client_socket, Data_connection_method *data_connection_method) {
     srand(time(NULL));
     int random_port = rand() % (65535 - 20000 + 1) + 20000;
+    int data_socket = 0;
+
+    while (1) {
+        random_port = rand() % (65535 - 20000 + 1) + 20000;
+
+        // 创建一个新的socket并监听这个随机端口
+        data_socket = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in data_addr;
+        data_addr.sin_family = AF_INET;
+        data_addr.sin_addr.s_addr = INADDR_ANY; // 监听所有接口
+        data_addr.sin_port = htons(random_port);
+        if (bind(data_socket, (struct sockaddr *)&data_addr, sizeof(data_addr)) == 0) {
+            listen(data_socket, MAX_CLIENTS); // 监听连接
+            break;
+        } else {
+            close(data_socket);  // Port is already in use, try another
+        }
+    }
 
     int p1 = random_port / 256;
     int p2 = random_port % 256;
     char response[100];
-    sprintf(response, "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).\r\n", 
-        atoi(strtok(server_ip, ".")), 
-        atoi(strtok(NULL, ".")), 
-        atoi(strtok(NULL, ".")), 
-        atoi(strtok(NULL, ".")), 
-        p1, p2);
+    int ip1, ip2, ip3, ip4;
+    sscanf(server_ip, "%d.%d.%d.%d", &ip1, &ip2, &ip3, &ip4);
+    sprintf(response, "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).\r\n", ip1, ip2, ip3, ip4, p1, p2);
+
     send(client_socket, response, strlen(response), 0);
 
-    // 创建一个新的socket并监听这个随机端口
-    data_socket = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in data_addr;
-    data_addr.sin_family = AF_INET;
-    data_addr.sin_addr.s_addr = INADDR_ANY; // 监听所有接口
-    data_addr.sin_port = htons(random_port);
-    bind(data_socket, (struct sockaddr *)&data_addr, sizeof(data_addr));
-    listen(data_socket, MAX_CLIENTS); // 监听连接
-
-    // while (1) {
-    //     client_info *data_cli = malloc(sizeof(client_info));
-    //     socklen_t addr_size = sizeof(data_cli->address);
-    //     data_cli->socket = accept(data_socket, (struct sockaddr *)&data_cli->address, &addr_size);
-        
-    //     // pthread_t thread;
-    //     // pthread_create(&thread, NULL, handle_client, data_cli);
-    //     // pthread_detach(thread);
-    // }
-
-    // close(data_socket);
-    return data_socket;
+    data_connection_method->data_socket = data_socket;
+    data_connection_method->method = PASV;
 }
 
-void handle_retr_command(const char *filename, int client_socket, int data_socket, client_info *data_cli) {
+// 建立数据连接
+void build_data_connection(int client_socket, Data_connection_method *data_connection_method, client_info *data_cli) {
+    if (data_connection_method->method == PASV) {
+        socklen_t addr_size = sizeof(data_cli->address);
+        data_cli->socket = accept(data_connection_method->data_socket, (struct sockaddr *)&data_cli->address, &addr_size);
+    } else if(data_connection_method->method == PORT) {
+        data_cli->address.sin_family = AF_INET;
+        data_cli->address.sin_port = htons(data_connection_method->port_number);
+        inet_pton(AF_INET, data_connection_method->ip_address, &data_cli->address.sin_addr);
+
+        int max_attempts = 10;
+        int connected = 0;
+        for (int i = 0; i < max_attempts; i++) {
+            data_connection_method->data_socket = socket(AF_INET, SOCK_STREAM, 0);
+            data_cli->socket = data_connection_method->data_socket;
+            if (connect(data_cli->socket, (struct sockaddr *)&data_cli->address, sizeof(data_cli->address)) == 0) {
+                connected = 1;
+                break;
+            }
+            perror("Retrying connection to client in PORT mode");
+            sleep(1);
+        }
+        if (!connected) {
+            perror("Failed to connect to client in PORT mode");
+            close(data_connection_method->data_socket);
+            return;
+        }
+    } else {
+        send(client_socket, "500 Data connection must be established before transporting data.\r\n", 67, 0);
+    }
+}
+
+void handle_retr_command(
+    const char *filename,
+    int client_socket,
+    Data_connection_method *data_connection_method,
+    client_info *data_cli
+    ) {
+    if (data_connection_method->method == PASV && data_connection_method->data_socket == 0) {
+        perror("Data socket not established");
+        send(client_socket, "425 Can't open data connection.\r\n", 33, 0);
+    }
+
     char filepath[BUFFER_SIZE];
     sprintf(filepath, "%s/%s", root_directory, filename);
-
-    socklen_t addr_size = sizeof(data_cli->address);
 
     FILE *file = fopen(filepath, "rb");
     if (file == NULL) {
@@ -90,24 +142,36 @@ void handle_retr_command(const char *filename, int client_socket, int data_socke
     }
     send(client_socket, "150 Opening binary mode data connection.\r\n", 42, 0);
 
+    build_data_connection(client_socket, data_connection_method, data_cli);
+
     char buffer[BUFFER_SIZE];
     size_t bytes_read;
-
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        send(data_socket, buffer, bytes_read, 0);
+        send(data_cli->socket, buffer, bytes_read, 0);
     }
 
     fclose(file);
-    close(data_socket); // 关闭数据连接
+    close(data_cli->socket);
+    if (data_connection_method->method == PASV) {
+        close(data_connection_method->data_socket);
+    }
 
     send(client_socket, "226 Transfer complete.\r\n", 24, 0);
 }
 
-void handle_stor_command(const char *filename, int client_socket, int data_socket, client_info *data_cli) {
+void handle_stor_command(
+    const char *filename,
+    int client_socket,
+    Data_connection_method *data_connection_method,
+    client_info *data_cli
+    ) {
+    if (data_connection_method->method == PASV && data_connection_method->data_socket == 0) {
+        perror("Data socket not established");
+        send(client_socket, "425 Can't open data connection.\r\n", 33, 0);
+    }
+
     char filepath[BUFFER_SIZE];
     sprintf(filepath, "%s/%s", root_directory, filename);
-
-    socklen_t addr_size = sizeof(data_cli->address);
 
     FILE *file = fopen(filepath, "wb");
     if (file == NULL) {
@@ -116,19 +180,76 @@ void handle_stor_command(const char *filename, int client_socket, int data_socke
     }
     send(client_socket, "150 Ready to receive data.\r\n", 28, 0);
     
-    data_cli->socket = accept(data_socket, (struct sockaddr *)&data_cli->address, &addr_size);
-
+    build_data_connection(client_socket, data_connection_method, data_cli);
+    
     char buffer[BUFFER_SIZE];
     ssize_t bytes_received;
     while ((bytes_received = recv(data_cli->socket, buffer, BUFFER_SIZE, 0)) > 0) {
         fwrite(buffer, 1, bytes_received, file);
-        printf("bytes");
     }
 
     fclose(file);
-    close(data_cli->socket); // 关闭数据连接
+    close(data_cli->socket);
+    if (data_connection_method->method == PASV) {
+        close(data_connection_method->data_socket);
+    }
 
     send(client_socket, "226 Transfer complete.\r\n", 24, 0);
+}
+
+void handle_list_command(
+    int client_socket,
+    Data_connection_method *data_connection_method,
+    client_info *data_cli,
+    char *current_dir // 传入当前工作目录
+    ) {
+    DIR *dir;
+    struct dirent *entry;
+    struct stat file_stat;
+    char file_info[BUFFER_SIZE];
+
+    // 打开当前目录
+    dir = opendir(current_dir);
+    if (dir == NULL) {
+        send(client_socket, "550 Failed to open directory.\r\n", 31, 0);
+        return;
+    }
+
+    // 建立数据连接
+    send(client_socket, "150 Here comes the directory listing.\r\n", 39, 0);
+    build_data_connection(client_socket, data_connection_method, data_cli);
+
+    // 遍历目录项
+    while ((entry = readdir(dir)) != NULL) {
+        printf("wow\n");
+        // 获取文件状态
+        char full_path[BUFFER_SIZE];
+        sprintf(full_path, "%s/%s", current_dir, entry->d_name);
+        if (stat(full_path, &file_stat) == -1) {
+            continue;  // 跳过错误的文件
+        }
+
+        // 构建文件信息，使用Unix风格的 ls -l 格式
+        char file_type = (S_ISDIR(file_stat.st_mode)) ? 'd' : '-';
+        sprintf(file_info, "%c--------- 1 user group %lld Jan 1 00:00 %s\r\n", 
+                file_type, 
+                (long long)file_stat.st_size, 
+                entry->d_name);
+
+        // 发送文件信息到数据连接
+        send(data_cli->socket, file_info, strlen(file_info), 0);
+    }
+
+    // 关闭目录
+    closedir(dir);
+
+    // 关闭数据连接
+    close(data_cli->socket);
+    if (data_connection_method->method == PASV) {
+        close(data_connection_method->data_socket);
+    }
+
+    send(client_socket, "226 Directory send OK.\r\n", 24, 0);
 }
 
 // 处理单个客户端多次请求的函数
@@ -138,36 +259,34 @@ void *handle_client(void *arg) {
     int logged_in = 0;
 
     client_info *data_cli = (client_info *)malloc(sizeof(client_info));
-    // char data_buffer[BUFFER_SIZE];
 
-    // 用于存储客户端的IP地址和端口
-    int constructing_data_socket = 0; // 为0时表示未经过PORT，不需建立data_socket；否则表示需要建立data_socket
-    char client_ip[INET_ADDRSTRLEN];
-    int client_port;
-
-    // 已建立数据连接
-    int constructed_data_socket = 0;
-    int data_socket = -1;
+    Data_connection_method *data_connection_method = malloc(sizeof(Data_connection_method));
+    data_connection_method->method = NOTHING;
 
     // 发送欢迎消息
     send(cli->socket, "220 Anonymous FTP server ready.\r\n", 33, 0);
+
+    char abs_root[BUFFER_SIZE];
+    char current_dir[BUFFER_SIZE];
+
+    // 初始化 CURRENT_DIR 为 root_directory 的绝对路径
+    if (realpath(root_directory, abs_root) != NULL) {
+        strcpy(current_dir, abs_root);
+        strcpy(root_directory, abs_root);
+    } else {
+        // 错误处理
+        send(cli->socket, "550 Failed to resolve root directory.\r\n", 39, 0);
+    }
 
     while (1) {
         memset(buffer, 0, sizeof(buffer));
         int bytes_received = recv(cli->socket, buffer, sizeof(buffer) - 1, 0);
         int data_bytes_received = 0;
         
-        // memset(data_buffer, 0, sizeof(data_buffer));
-        // if(constructed_data_socket) {
-        //     data_bytes_received = recv(cli->socket, data_buffer, sizeof(data_buffer) - 1, 0);
-        // }
-        
         if (bytes_received <= 0 && data_bytes_received <= 0) {
             continue;
         }
         
-        // printf("received %s\n", buffer);
-
         if (logged_in == 0) {
             // 用户未登录
             if (strncmp(buffer, "USER anonymous", 14) == 0) { // 要不要改？
@@ -195,43 +314,117 @@ void *handle_client(void *arg) {
         } else {
             // 用户已登录
             if (strncmp(buffer, "PORT", 4) == 0) {
-                handle_port_command(buffer, cli->socket, client_ip, &client_port);
-                constructing_data_socket = 1;
+                if (data_connection_method->data_socket > 0) {
+                    close(data_connection_method->data_socket);
+                }
+                if (data_cli->socket > 0) {
+                    close(data_cli->socket);
+                }
+                handle_port_command(buffer, cli->socket, data_connection_method);
             } else if (strncmp(buffer, "PASV", 4) == 0) {
-                data_socket = handle_pasv_command(cli->socket);
-                constructed_data_socket = 1;
-                // data_cli->socket = accept(data_socket, (struct sockaddr *)&data_cli->address, NULL);
-                // printf("data_cli->socket: %d\n", data_cli->socket);
+                if (data_connection_method->data_socket > 0) {
+                    close(data_connection_method->data_socket);
+                }
+                if (data_cli->socket > 0) {
+                    close(data_cli->socket);
+                }
+                handle_pasv_command(cli->socket, data_connection_method);
             } else if (strncmp(buffer, "RETR", 4) == 0) {
                 char filename[BUFFER_SIZE];
                 sscanf(buffer, "RETR %s", filename);
-                if(constructed_data_socket) {
-                    if (data_cli->socket == -1) {
-                        perror("Data socket not established");
-                        send(cli->socket, "425 Can't open data connection.\r\n", 33, 0);
-                    }
-                    handle_retr_command(filename, cli->socket, data_socket, data_cli);
-                } else if(constructing_data_socket) {
-
-                } else {
-                    send(cli->socket, "500 Data connection must be established before transporting data.\r\n", 67, 0);
-                }
+                handle_retr_command(filename, cli->socket, data_connection_method, data_cli);
             } else if (strncmp(buffer, "STOR", 4) == 0) {
                 char filename[BUFFER_SIZE];
                 sscanf(buffer, "STOR %s", filename);
-                if(constructed_data_socket) {
-                    if (data_cli->socket == -1) {
-                        perror("Data socket not established");
-                        send(cli->socket, "425 Can't open data connection.\r\n", 33, 0);
-                    }
-                    handle_stor_command(filename, cli->socket, data_socket, data_cli);
-                } else if(constructing_data_socket) {
+                handle_stor_command(filename, cli->socket, data_connection_method, data_cli);
+            } else if (strcmp(buffer, "SYST") == 0) {
+                send(cli->socket, "215 UNIX Type: L8\r\n", 19, 0);
+            } else if (strncmp(buffer, "TYPE", 4) == 0) {
+                char type_code[1];
+                sscanf(buffer, "TYPE %s", type_code);
 
+                if (strncmp(type_code, "I", 1) == 0) {
+                    send(cli->socket, "200 Type set to I.\r\n", 20, 0);
                 } else {
-                    send(cli->socket, "500 Data connection must be established before transporting data.\r\n", 67, 0);
+                    send(cli->socket, "504 Command not implemented for that parameter.\r\n", 49, 0);
                 }
-                // send(cli->socket, "500 Data connection must be established before transporting data.\r\n", 67, 0);
-            } else if(strcmp(buffer, "QUIT") == 0) {
+            } else if (strncmp(buffer, "MKD", 3) == 0) {
+                char directory[BUFFER_SIZE];
+                sscanf(buffer, "MKD %s", directory);
+                
+                char path[BUFFER_SIZE];
+                sprintf(path, "%s/%s", current_dir, directory);
+                
+                if (mkdir(path, 0777) == 0) {
+                    char response[BUFFER_SIZE];
+                    sprintf(response, "257 \"%s\" directory created.\r\n", directory);
+                    send(cli->socket, response, strlen(response), 0);
+                } else {
+                    send(cli->socket, "550 Failed to create directory.\r\n", 33, 0);
+                }
+            } else if (strncmp(buffer, "CWD", 3) == 0) {
+                char directory[BUFFER_SIZE];
+                sscanf(buffer, "CWD %s", directory);
+                
+                char target_path[BUFFER_SIZE];
+                if (directory[0] == '/') {
+                    sprintf(target_path, "%s%s", root_directory, directory);
+                } else {
+                    sprintf(target_path, "%s/%s", current_dir, directory);
+                }
+
+                char real_path[BUFFER_SIZE];
+                if (realpath(target_path, real_path) != NULL && strncmp(real_path, root_directory, strlen(root_directory)) == 0) {
+                    strcpy(current_dir, real_path);
+                    send(cli->socket, "250 Directory successfully changed.\r\n", 37, 0);
+                } else {
+                    send(cli->socket, "550 Access denied.\r\n", 20, 0);
+                }
+            } else if (strncmp(buffer, "PWD", 3) == 0) {
+                char abs_root[BUFFER_SIZE];
+
+                if (realpath(root_directory, abs_root) == NULL) {
+                    send(cli->socket, "550 Failed to resolve root directory.\r\n", 39, 0);
+                } else {
+                    if (strncmp(current_dir, abs_root, strlen(abs_root)) == 0) {
+                        char relative_path[BUFFER_SIZE] = "/";
+
+                        const char *sub_dir = current_dir + strlen(abs_root);
+                        if (strlen(sub_dir) > 0) {
+                            strcat(relative_path, sub_dir + 1);  // 加上子目录
+                        }
+
+                        char response[BUFFER_SIZE];
+                        sprintf(response, "257 \"%s\"\r\n", relative_path);
+                        send(cli->socket, response, strlen(response), 0);
+                    } else {
+                        send(cli->socket, "550 Failed to get current directory.\r\n", 38, 0);
+                    }
+                }
+            } else if (strncmp(buffer, "LIST", 4) == 0) {
+                handle_list_command(cli->socket, data_connection_method, data_cli, current_dir);
+            } else if (strncmp(buffer, "RMD", 3) == 0) {
+                char directory[BUFFER_SIZE];
+                sscanf(buffer, "RMD %s", directory);
+                
+                // 创建完整路径，基于当前工作目录
+                char path[BUFFER_SIZE];
+                sprintf(path, "%s/%s", current_dir, directory);
+                
+                if (rmdir(path) == 0) {
+                    send(cli->socket, "250 Directory successfully removed.\r\n", 37, 0);
+                } else {
+                    send(cli->socket, "550 Failed to remove directory.\r\n", 33, 0);
+                }
+            } else if (strncmp(buffer, "QUIT", 4) == 0) {
+                send(cli->socket, "200 Quit successeully.\r\n", 24, 0);
+                close(cli->socket);
+                if (data_cli->socket > 0) {
+                    close(data_cli->socket);
+                }
+                if(data_connection_method->data_socket > 0) {
+                    close(data_cli->socket);
+                }
                 break;
             } else {
                 send(cli->socket, "500 Command not implemented for logged-in users.\r\n", 50, 0);
@@ -243,6 +436,8 @@ void *handle_client(void *arg) {
     free(cli);
     close(data_cli->socket);
     free(data_cli);
+
+    free(data_connection_method);
     return NULL;
 }
 

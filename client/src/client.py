@@ -1,11 +1,29 @@
 import socket
 import sys
-import random
-import os
+from enum import Enum
 
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 21
 BUFFER_SIZE = 8192
+
+# TODO 如果没PASV或PORT要报错
+# TODO 连服务器，测试大文件传输
+# TODO 纠错
+# TODO 选做，图形化界面
+# TODO 选做，断线重连
+# TODO 传输文件开启新线程
+# TODO 少几个命令
+
+class Method(Enum):
+    NOTHING = 1
+    PASV = 2
+    PORT = 3
+
+class Data_connection_method:
+    def __init__(self):
+        self.method: Method = Method.NOTHING
+        self.ip_address: str = ""
+        self.port_number: int = 0
 
 def parse_arguments():
     ip_address = DEFAULT_IP
@@ -19,77 +37,127 @@ def parse_arguments():
 
     return ip_address, port_number
 
+def get_local_ip():
+    try:
+        # 创建一个临时 socket 连接到外部（即使不实际连接也能获取 IP）
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception as e:
+        return f"Error: {e}"
+
 def send_command(sock: socket.socket, command):
+    """
+    向server发送一次请求并获得一次预期response.
+    """
     sock.sendall(command.encode())
+    return receive_response(sock)
+
+def receive_response(sock: socket.socket):
+    """
+    从server获得一次预期response.
+    """
     response = ''
     while True:
-        # 从服务器接收数据
         part = sock.recv(BUFFER_SIZE).decode()
         response += part
 
-        # 检查响应开头是否是三位状态码
         lines = response.splitlines()
 
         if len(lines) > 0:
-            # 解析第一行
             last_line = lines[-1]
             
-            # 如果是多行响应，状态码后会带有连字符 (e.g., "230-")
             if len(last_line) >= 4 and last_line[3] == '-':
-                continue  # 继续接收响应
-
-            # 检查状态码后是否是空格 (e.g., "230 ")
+                continue
             if len(last_line) >= 4 and last_line[3] == ' ':
-                break  # 单行响应或最后一行响应，退出循环
+                break
 
-    # 打印并返回完整的响应信息
     print("RESPONSE:\n", response.strip())
     return last_line.strip()
 
-def retrieve_file(sock: socket.socket, filename: str, data_ip_address, constructing_data_method: dict):
+def retrieve_file(sock: socket.socket, filename: str, data_connection_method: Data_connection_method):
     local_save_path = input("Input the local path to save the downloaded file: ")
     response = send_command(sock, f"RETR {filename}")
 
     if response.startswith("550 "):
-        return
+        return False
     elif response.startswith("150 "):
-        if constructing_data_method["method"] == "PORT":
-            pass
-        elif constructing_data_method["method"] == "PASV":
-            data_ip_address = constructing_data_method["ip_address"]
-            data_port_number = constructing_data_method["port_number"]
+        if data_connection_method.method == Method.PORT:
+            data_ip_address = data_connection_method.ip_address
+            data_port_number = data_connection_method.port_number
+
+            data_sock_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            data_sock_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            data_sock_listen.bind((data_ip_address, data_port_number))
+            data_sock_listen.listen(1)
+
+            data_sock, addr = data_sock_listen.accept()
+            print("Data connection established.")
+        elif data_connection_method.method == Method.PASV:
+            data_ip_address = data_connection_method.ip_address
+            data_port_number = data_connection_method.port_number
 
             data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             data_sock.connect((data_ip_address, data_port_number))
             print("Data connection established.")
         else:
             print("Data connection must be established befoere transporting data.")
-            return
+            return False
         
-        # TODO
+        with open(local_save_path, 'wb') as f:
+            while True:
+                data = data_sock.recv(BUFFER_SIZE)
+                if not data:
+                    break
+                f.write(data)
+                print(f"Received {len(data)} bytes")
+        
         data_sock.close()
+        if data_connection_method == Method.PORT:
+            data_sock_listen.close()
+
+        response = receive_response(sock)
+        if response.startswith("226 "):
+            print(f"File {filename} retrieved successfully.")
+        else:
+            print("Something went wrong while storing.")
+
+        return True
     else:
         pass
 
-def store_file(sock: socket.socket, filename: str, constructing_data_method: dict):
+def store_file(sock: socket.socket, filename: str, data_connection_method: Data_connection_method):
     local_file_name = input("Input the local file to upload: ")
     response = send_command(sock, f"STOR {filename}")
 
     if response.startswith("550 "):
-        return
+        return False
     elif response.startswith("150 "):
-        if constructing_data_method["method"] == "PORT":
-            pass
-        elif constructing_data_method["method"] == "PASV":
-            data_ip_address = constructing_data_method["ip_address"]
-            data_port_number = constructing_data_method["port_number"]
+        if data_connection_method.method == Method.PORT:
+            data_ip_address = data_connection_method.ip_address
+            data_port_number = data_connection_method.port_number
+
+            data_sock_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            data_sock_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            data_sock_listen.bind((data_ip_address, data_port_number))
+            data_sock_listen.listen(1)
+
+            data_sock, addr = data_sock_listen.accept()
+            print("Data connection established.")
+        elif data_connection_method.method == Method.PASV:
+            data_ip_address = data_connection_method.ip_address
+            data_port_number = data_connection_method.port_number
 
             data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             data_sock.connect((data_ip_address, data_port_number))
             print("Data connection established.")
         else:
             print("Data connection must be established befoere transporting data.")
-            return
+            return False
         
         with open(local_file_name, 'rb') as f:
             while True:
@@ -98,8 +166,18 @@ def store_file(sock: socket.socket, filename: str, constructing_data_method: dic
                     break
                 data_sock.sendall(data)
                 print(f"Sent {len(data)} bytes")
-            print(f"File {filename} stored successfully.")
+        
         data_sock.close()
+        if data_connection_method.method == Method.PORT:
+            data_sock_listen.close()
+        
+        response = receive_response(sock)
+        if response.startswith("226 "):
+            print(f"File {filename} stored successfully.")
+        else:
+            print("Something went wrong while storing.")
+        
+        return True
     else:
         pass
 
@@ -109,13 +187,90 @@ def create_data_socket(ip, port):
     data_sock.listen(1)  # Listen for one connection
     return data_sock
 
+def list_files(sock: socket.socket, data_connection_method: Data_connection_method):
+    response = send_command(sock, "LIST")
+    print(response + "\n\naaa")
+    if response.startswith("150 "):
+        if data_connection_method.method == Method.PORT:
+            data_ip_address = data_connection_method.ip_address
+            data_port_number = data_connection_method.port_number
+
+            data_sock_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            data_sock_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            data_sock_listen.bind((data_ip_address, data_port_number))
+            data_sock_listen.listen(1)
+
+            data_sock, addr = data_sock_listen.accept()
+            print("Data connection established.")
+        elif data_connection_method.method == Method.PASV:
+            data_ip_address = data_connection_method.ip_address
+            data_port_number = data_connection_method.port_number
+
+            data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            print("whywhy\n\nwhywhy")
+            data_sock.connect((data_ip_address, data_port_number))
+            print("Data connection established.")
+        else:
+            print("Data connection must be established before retrieving the file list.")
+            return False
+        
+        print("Receiving file list:")
+        file_list = ''
+        while True:
+            data = data_sock.recv(BUFFER_SIZE).decode()
+            if not data:
+                break
+            file_list += data
+
+        print(file_list)
+        data_sock.close()
+        if data_connection_method.method == Method.PORT:
+            data_sock_listen.close()
+
+        response = receive_response(sock)
+        if response.startswith("226 "):
+            print("File list retrieved successfully.")
+        else:
+            print("Something went wrong while retrieving the file list.")
+
+        return True
+    else:
+        print("Failed to retrieve file list.")
+        return False
+
+def change_directory(sock: socket.socket, directory: str):
+    response = send_command(sock, f"CWD {directory}")
+    
+    if response.startswith("250 "):
+        print(f"Changed directory to {directory}")
+    else:
+        print(f"Failed to change directory to {directory}: {response}")
+
+def print_working_directory(sock: socket.socket):
+    response = send_command(sock, "PWD")
+    if response.startswith("257 "):
+        print(f"Current directory: {response}")
+    else:
+        print(f"Failed to get working directory: {response}")
+
+def make_directory(sock: socket.socket, directory: str):
+    response = send_command(sock, f"MKD {directory}")
+    if response.startswith("257 "):
+        print(f"Directory {directory} created successfully.")
+    else:
+        print(f"Failed to create directory {directory}: {response}")
+
+def remove_directory(sock: socket.socket, directory: str):
+    response = send_command(sock, f"RMD {directory}")
+    if response.startswith("250 "):
+        print(f"Directory {directory} removed successfully.")
+    else:
+        print(f"Failed to remove directory {directory}: {response}")
+
 def main():
     ip_address, port_number = parse_arguments()
-    constructing_data_method = {
-        "method": "nothing",
-        "ip_address": "",
-        "port_number": -1
-    }
+    data_connection_method = Data_connection_method()
 
     # 创建TCP socket连接
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -150,10 +305,6 @@ def main():
 
         while logged_in:
             command = input("Enter command: ")
-            if command.lower() == 'quit':
-                send_command(sock, 'QUIT')
-                break
-
             if command.startswith("PORT"):
                 # 用户以 "127.0.0.1:8888" 格式提供IP和端口
                 ip_port = input("Enter your IP address and port (e.g., 127.0.0.1:8888): ")
@@ -168,7 +319,10 @@ def main():
                         port2 = port_number % 256
                         port_command = f"PORT {','.join(ip_parts)},{port1},{port2}"
                         response = send_command(sock, port_command)
-                        constructing_data_method["method"] = "PORT"
+
+                        data_connection_method.method = Method.PORT
+                        data_connection_method.ip_address = ip_address
+                        data_connection_method.port_number = port_number
                     else:
                         print("Invalid port number. Please enter a port number between 20000 and 65535.")
                 except ValueError:
@@ -185,34 +339,50 @@ def main():
                     print(f"Server IP: {data_ip_address}, Port: {data_port_number}")
 
                     # 创建数据连接
-                    # with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as data_sock:
-                    # data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    # data_sock.connect((data_ip_address, data_port_number))
-                    # print("Data connection established.")
-                    constructing_data_method["method"] = "PASV"
-                    constructing_data_method["ip_address"] = data_ip_address
-                    constructing_data_method["port_number"] = data_port_number
+                    data_connection_method.method = Method.PASV
+                    data_connection_method.ip_address = data_ip_address
+                    data_connection_method.port_number = data_port_number
 
             elif command.startswith("RETR"):
                 filename = command.split(' ')[1]
-                retrieve_file(sock, filename, constructing_data_method)
+                if retrieve_file(sock, filename, data_connection_method):
+                    data_connection_method.method = Method.NOTHING
 
             elif command.startswith("STOR"):
                 filename = command.split(' ')[1]
-                store_file(sock, filename, constructing_data_method)
-                #     data_sock.close()
-                #     constructed_data_connection = False
-                # elif constructing_data_connection:
-                #     pass
-                # else:
-                #     print("Data connection must be established befoere transporting data.")
+                if store_file(sock, filename, data_connection_method):
+                    data_connection_method.method = Method.NOTHING
 
-            # 解析和发送其他FTP命令
-            # response = send_command(sock, command)
-            # if response.startswith("200"):  # 一般命令成功的返回码
-            #     print("Command executed successfully.")
-            # else:
-            #     print("Command failed with response:", response)
+            elif command == "SYST":
+                send_command(sock, "SYST")
+
+            elif command.startswith("TYPE"):
+                type_code = input("Enter transfer type (A for ASCII, I for binary): ").strip().upper()
+                send_command(sock, f"TYPE {type_code}")
+
+            elif command.startswith("LIST"):
+                if list_files(sock, data_connection_method):
+                    data_connection_method.method = Method.NOTHING
+
+            elif command.startswith("CWD"):
+                directory = command.split(' ')[1]
+                change_directory(sock, directory)
+
+            elif command.startswith("PWD"):
+                print_working_directory(sock)
+
+            elif command.startswith("MKD"):
+                directory = command.split(' ')[1]
+                make_directory(sock, directory)
+
+            elif command.startswith("RMD"):
+                directory = command.split(' ')[1]
+                remove_directory(sock, directory)
+
+            if command == 'QUIT' or command == 'ABOR':
+                send_command(sock, 'QUIT')
+                sock.close()
+                break
 
 if __name__ == "__main__":
     main()
