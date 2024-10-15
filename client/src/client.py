@@ -189,7 +189,6 @@ def create_data_socket(ip, port):
 
 def list_files(sock: socket.socket, data_connection_method: Data_connection_method):
     response = send_command(sock, "LIST")
-    print(response + "\n\naaa")
     if response.startswith("150 "):
         if data_connection_method.method == Method.PORT:
             data_ip_address = data_connection_method.ip_address
@@ -208,11 +207,11 @@ def list_files(sock: socket.socket, data_connection_method: Data_connection_meth
             data_port_number = data_connection_method.port_number
 
             data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            print("whywhy\n\nwhywhy")
             data_sock.connect((data_ip_address, data_port_number))
             print("Data connection established.")
         else:
             print("Data connection must be established before retrieving the file list.")
+            response = receive_response(sock)
             return False
         
         print("Receiving file list:")

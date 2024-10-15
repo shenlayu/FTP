@@ -13,8 +13,6 @@
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 10
 
-// TODO: 用docker
-
 // 结构体用于存储客户端信息
 typedef struct {
     int socket;
@@ -36,6 +34,9 @@ typedef struct {
 
 char *root_directory = DEFAULT_ROOT; // 默认根目录
 int port_number = DEFAULT_PORT;        // 默认端口
+
+char abs_root[BUFFER_SIZE];
+char current_dir[BUFFER_SIZE];
 
 // 服务器IP地址
 char server_ip[INET_ADDRSTRLEN] = "127.0.0.1";
@@ -90,7 +91,7 @@ void handle_pasv_command(int client_socket, Data_connection_method *data_connect
 }
 
 // 建立数据连接
-void build_data_connection(int client_socket, Data_connection_method *data_connection_method, client_info *data_cli) {
+int build_data_connection(int client_socket, Data_connection_method *data_connection_method, client_info *data_cli) {
     if (data_connection_method->method == PASV) {
         socklen_t addr_size = sizeof(data_cli->address);
         data_cli->socket = accept(data_connection_method->data_socket, (struct sockaddr *)&data_cli->address, &addr_size);
@@ -114,11 +115,14 @@ void build_data_connection(int client_socket, Data_connection_method *data_conne
         if (!connected) {
             perror("Failed to connect to client in PORT mode");
             close(data_connection_method->data_socket);
-            return;
+            return 0;
         }
     } else {
         send(client_socket, "500 Data connection must be established before transporting data.\r\n", 67, 0);
+        return 0;
     }
+
+    return 1;
 }
 
 void handle_retr_command(
@@ -133,7 +137,7 @@ void handle_retr_command(
     }
 
     char filepath[BUFFER_SIZE];
-    sprintf(filepath, "%s/%s", root_directory, filename);
+    sprintf(filepath, "%s/%s", current_dir, filename);
 
     FILE *file = fopen(filepath, "rb");
     if (file == NULL) {
@@ -142,7 +146,10 @@ void handle_retr_command(
     }
     send(client_socket, "150 Opening binary mode data connection.\r\n", 42, 0);
 
-    build_data_connection(client_socket, data_connection_method, data_cli);
+    int data_success = build_data_connection(client_socket, data_connection_method, data_cli);
+    if(!data_success) {
+        return;
+    }
 
     char buffer[BUFFER_SIZE];
     size_t bytes_read;
@@ -171,7 +178,7 @@ void handle_stor_command(
     }
 
     char filepath[BUFFER_SIZE];
-    sprintf(filepath, "%s/%s", root_directory, filename);
+    sprintf(filepath, "%s/%s", current_dir, filename);
 
     FILE *file = fopen(filepath, "wb");
     if (file == NULL) {
@@ -180,7 +187,10 @@ void handle_stor_command(
     }
     send(client_socket, "150 Ready to receive data.\r\n", 28, 0);
     
-    build_data_connection(client_socket, data_connection_method, data_cli);
+    int data_success = build_data_connection(client_socket, data_connection_method, data_cli);
+    if(!data_success) {
+        return;
+    }
     
     char buffer[BUFFER_SIZE];
     ssize_t bytes_received;
@@ -217,11 +227,13 @@ void handle_list_command(
 
     // 建立数据连接
     send(client_socket, "150 Here comes the directory listing.\r\n", 39, 0);
-    build_data_connection(client_socket, data_connection_method, data_cli);
+    int data_success = build_data_connection(client_socket, data_connection_method, data_cli);
+    if(!data_success) {
+        return;
+    }
 
     // 遍历目录项
     while ((entry = readdir(dir)) != NULL) {
-        printf("wow\n");
         // 获取文件状态
         char full_path[BUFFER_SIZE];
         sprintf(full_path, "%s/%s", current_dir, entry->d_name);
@@ -265,9 +277,6 @@ void *handle_client(void *arg) {
 
     // 发送欢迎消息
     send(cli->socket, "220 Anonymous FTP server ready.\r\n", 33, 0);
-
-    char abs_root[BUFFER_SIZE];
-    char current_dir[BUFFER_SIZE];
 
     // 初始化 CURRENT_DIR 为 root_directory 的绝对路径
     if (realpath(root_directory, abs_root) != NULL) {
@@ -374,9 +383,18 @@ void *handle_client(void *arg) {
                 }
 
                 char real_path[BUFFER_SIZE];
+                struct stat path_stat;
+                
+                // 解析真实路径并检查路径是否在root_directory下
                 if (realpath(target_path, real_path) != NULL && strncmp(real_path, root_directory, strlen(root_directory)) == 0) {
-                    strcpy(current_dir, real_path);
-                    send(cli->socket, "250 Directory successfully changed.\r\n", 37, 0);
+                    // 检查目标路径是否为目录
+                    if (stat(real_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
+                        strcpy(current_dir, real_path);  // 只在确认是目录时才修改current_dir
+                        send(cli->socket, "250 Directory successfully changed.\r\n", 37, 0);
+                    } else {
+                        // 目标路径存在但不是目录
+                        send(cli->socket, "550 Not a directory.\r\n", 22, 0);
+                    }
                 } else {
                     send(cli->socket, "550 Access denied.\r\n", 20, 0);
                 }
