@@ -9,11 +9,6 @@ DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 21
 BUFFER_SIZE = 8192
 
-# TODO 纠错
-# TODO 选做，图形化界面
-# TODO 选做，断线重连
-# TODO 传输文件开启新线程
-
 class Method(Enum):
     NOTHING = 1
     PASV = 2

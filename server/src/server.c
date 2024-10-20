@@ -357,7 +357,6 @@ void *handle_client(void *arg) {
     while (1) {
         memset(buffer, 0, sizeof(buffer));
         int bytes_received = recv(cli->socket, buffer, sizeof(buffer) - 1, 0);
-        int data_bytes_received = 0;
         
         if (bytes_received < 0) {
             perror("recv");
