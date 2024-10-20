@@ -26,7 +26,8 @@ def send_command(sock: socket.socket, command):
     """
     向server发送一次请求并获得一次预期response.
     """
-    sock.sendall(command.encode())
+    message = command + "\r\n"
+    sock.sendall(message.encode())
     return receive_response(sock)
 
 def receive_response(sock: socket.socket):
